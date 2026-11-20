@@ -1,6 +1,6 @@
 # omarchy-ai-stats
 
-[![Version](https://img.shields.io/badge/version-v0.1.0-00e5ff.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-v0.1.1-00e5ff.svg)](VERSION)
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Omarchy%20%7C%20Hyprland-60a5fa.svg)](#)
 
@@ -122,4 +122,4 @@ cd omarchy-ai-stats
 
 ## 📄 开源协议
 
-本项目基于 [MIT License](./LICENSE) 开源发布，当前版本 `v0.1.0`。
+本项目基于 [MIT License](./LICENSE) 开源发布，当前版本 `v0.1.1`。

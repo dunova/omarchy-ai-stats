@@ -19,6 +19,7 @@ import sys
 import termios
 import time
 import tty
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -671,6 +672,15 @@ def fmt_short(n: int) -> str:
     return str(n)
 
 
+def disp_width(s: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in s)
+
+
+def ljust_disp(s: str, target_w: int) -> str:
+    pad = max(0, target_w - disp_width(s))
+    return s + (" " * pad)
+
+
 def render_bar(ratio: float, width: int = 36, color: str = "cyan") -> Text:
     width = max(10, width)
     clamped = max(0.0, min(1.0, ratio))
@@ -826,8 +836,8 @@ def build_layout(events: list, range_key: str, table_mode: bool, term_w: int, te
     for label, val, color in rows:
         pct = val / tot * 100.0
         comp.append("■ ", style=color)
-        comp.append(f"{label:<14}", style="bold")
-        comp.append(f"{fmt_num(val):>13} ", style="bold")
+        comp.append(ljust_disp(label, 16), style="bold")
+        comp.append(f"{fmt_num(val):>14} ", style="bold")
         comp.append(f"{pct:5.1f}%\n", style="bright_black")
         comp.append(render_bar(val / tot, width=panel_w, color=color))
         comp.append("\n\n")
@@ -855,7 +865,7 @@ def build_layout(events: list, range_key: str, table_mode: bool, term_w: int, te
         name_cap = max(12, panel_w - 22)
         short_model = model[:name_cap]
         cost_txt.append("■ ", style=color)
-        cost_txt.append(f"{short_model:<{name_cap}}", style="bold")
+        cost_txt.append(ljust_disp(short_model, name_cap), style="bold")
         cost_txt.append(f" 缓存 {hr:4.1f}% ", style=color)
         cost_txt.append(f"${data['cost']:>6.2f}\n", style="bold green")
         cost_txt.append(render_bar(data["cost"] / max_cost, width=panel_w, color=color))

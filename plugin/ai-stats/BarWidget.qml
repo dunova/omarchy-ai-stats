@@ -83,6 +83,10 @@ BarWidget {
     return "#f87171"
   }
 
+  function compactModelTitle(name) {
+    return String(name || "").replace("Orchestrator", "Orch.")
+  }
+
   Process {
     id: statsProc
     command: ["bash", "-c", "exec \"$HOME/.local/bin/omarchy-ai-stats\" --json-detail --range \"$1\"", "stats", root.selectedRange]
@@ -132,7 +136,7 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
-    contentWidth: popup.fittedContentWidth(Style.space(480))
+    contentWidth: popup.fittedContentWidth(Style.space(536))
     contentHeight: popup.fittedContentHeight(mainColumn.implicitHeight)
 
     Column {
@@ -140,6 +144,7 @@ BarWidget {
       width: parent.width
       spacing: Style.space(8)
 
+      // 顶部标题与时间区间切换
       Row {
         width: parent.width
         spacing: Style.space(8)
@@ -149,15 +154,30 @@ BarWidget {
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(2)
 
-          Text {
-            textFormat: Text.PlainText
-            text: "󰧑 AI 模型用量与缓存监控"
-            color: root.fgColor
-            font.family: root.uiFont
-            font.pixelSize: Style.font.subtitle
-            font.bold: true
-            elide: Text.ElideRight
+          Row {
             width: parent.width
+            spacing: Style.space(6)
+
+            Text {
+              textFormat: Text.PlainText
+              text: "󰧑"
+              color: root.accentColor
+              font.family: root.uiFont
+              font.pixelSize: Style.font.subtitle
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: "AI 模型用量与缓存监控"
+              color: root.fgColor
+              font.family: root.uiFont
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+              elide: Text.ElideRight
+              width: parent.width - Style.space(24)
+              anchors.verticalCenter: parent.verticalCenter
+            }
           }
 
           Text {
@@ -191,7 +211,7 @@ BarWidget {
               selected: root.selectedRange === modelData.key
               bordered: true
               fontSize: Style.font.caption
-              horizontalPadding: Style.space(8)
+              horizontalPadding: Style.space(9)
               verticalPadding: Style.space(4)
               onClicked: {
                 if (root.selectedRange !== modelData.key) {
@@ -206,6 +226,7 @@ BarWidget {
         }
       }
 
+      // 三列核心指标卡片
       Row {
         width: parent.width
         spacing: Style.space(8)
@@ -214,7 +235,7 @@ BarWidget {
           width: (parent.width - Style.space(16)) / 3
           height: Style.space(52)
           radius: Style.spacing.labelGap
-          color: Style.normalFillFor(root.fgColor)
+          color: Style.normalFillFor(root.fgColor, root.accentColor)
           borderSpec: Border.controlSpec("normal", root.fgColor, root.accentColor)
 
           Column {
@@ -248,7 +269,7 @@ BarWidget {
           width: (parent.width - Style.space(16)) / 3
           height: Style.space(52)
           radius: Style.spacing.labelGap
-          color: Style.normalFillFor(root.fgColor)
+          color: Style.normalFillFor(root.fgColor, root.accentColor)
           borderSpec: Border.controlSpec("normal", root.fgColor, root.accentColor)
 
           Column {
@@ -282,7 +303,7 @@ BarWidget {
           width: (parent.width - Style.space(16)) / 3
           height: Style.space(52)
           radius: Style.spacing.labelGap
-          color: Style.normalFillFor(root.fgColor)
+          color: Style.normalFillFor(root.fgColor, root.accentColor)
           borderSpec: Border.controlSpec("normal", root.fgColor, root.accentColor)
 
           Column {
@@ -314,6 +335,7 @@ BarWidget {
         }
       }
 
+      // Token 构成分布
       Column {
         width: parent.width
         spacing: Style.space(4)
@@ -377,9 +399,9 @@ BarWidget {
 
             Rectangle {
               width: parent.width
-              height: Style.space(4)
+              height: Style.space(5)
               radius: Style.space(2)
-              color: Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.12)
+              color: Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.14)
 
               Rectangle {
                 width: Math.max(modelData.pct > 0 ? Style.space(4) : 0, parent.width * Math.min(1.0, modelData.pct / 100.0))
@@ -393,9 +415,12 @@ BarWidget {
       }
 
       PanelSeparator {
+        width: parent.width
         foreground: root.fgColor
+        strength: 0.22
       }
 
+      // 前 4 模型独立分窗走势 (2x2)
       Column {
         width: parent.width
         spacing: Style.space(5)
@@ -409,15 +434,15 @@ BarWidget {
             font.family: root.uiFont
             font.pixelSize: Style.font.bodySmall
             font.bold: true
-            width: parent.width * 0.48
+            width: parent.width * 0.42
           }
           Text {
             textFormat: Text.PlainText
             text: (root.hoveredModelIdx >= 0 && root.hoveredSlotIdx >= 0 && root.stats.modelTrends && root.hoveredModelIdx < root.stats.modelTrends.length && root.hoveredSlotIdx < root.stats.modelTrends[root.hoveredModelIdx].buckets.length)
-              ? (root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].hasData
-                  ? (String(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].label) + " 命中 " + Number(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].hitRate).toFixed(1) + "% · " + String(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].tokensShort))
-                  : (String(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].label) + " 无调用"))
-              : "悬停色柱查看时段缓存数值"
+              ? ("#" + String(root.hoveredModelIdx + 1) + " · " + (root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].hasData
+                  ? (String(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].label) + " 命中 " + Number(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].hitRate).toFixed(1) + "% (" + String(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].tokensShort) + ")")
+                  : (String(root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].label) + " 无调用")))
+              : "悬停柱状查看该模型时段详情"
             color: (root.hoveredModelIdx >= 0 && root.hoveredSlotIdx >= 0 && root.stats.modelTrends && root.hoveredModelIdx < root.stats.modelTrends.length && root.hoveredSlotIdx < root.stats.modelTrends[root.hoveredModelIdx].buckets.length && root.stats.modelTrends[root.hoveredModelIdx].buckets[root.hoveredSlotIdx].hasData)
               ? String(root.stats.modelTrends[root.hoveredModelIdx].color)
               : root.mutedColor
@@ -425,7 +450,7 @@ BarWidget {
             font.pixelSize: Style.font.caption
             horizontalAlignment: Text.AlignRight
             elide: Text.ElideLeft
-            width: parent.width * 0.52
+            width: parent.width * 0.58
           }
         }
 
@@ -456,17 +481,17 @@ BarWidget {
               width: (parent.width - Style.space(6)) / 2
               height: Style.space(86)
               radius: Style.spacing.labelGap
-              color: Style.normalFillFor(root.fgColor)
-              borderSpec: Border.controlSpec("normal", root.fgColor, root.accentColor)
+              color: Style.normalFillFor(root.fgColor, root.accentColor)
+              borderSpec: Border.controlSpec(root.hoveredModelIdx === mCard.index ? "hover-cursor" : "normal", root.fgColor, root.accentColor)
 
               Column {
                 anchors.fill: parent
-                anchors.margins: Style.space(6)
+                anchors.margins: Style.space(7)
                 spacing: Style.space(4)
 
                 Row {
                   width: parent.width
-                  spacing: Style.space(4)
+                  spacing: Style.space(5)
 
                   Rectangle {
                     width: Style.space(6)
@@ -478,13 +503,13 @@ BarWidget {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: String(mCard.modelData.name || "")
+                    text: root.compactModelTitle(mCard.modelData.name)
                     color: root.fgColor
                     font.family: root.uiFont
                     font.pixelSize: Style.font.caption
                     font.bold: true
                     elide: Text.ElideRight
-                    width: parent.width - mHrText.implicitWidth - Style.space(14)
+                    width: parent.width - mHrText.implicitWidth - Style.space(16)
                     anchors.verticalCenter: parent.verticalCenter
                   }
 
@@ -500,9 +525,17 @@ BarWidget {
                   }
                 }
 
+                // 柱状图区 + 50% 参考基线
                 Item {
                   width: parent.width
-                  height: Style.space(42)
+                  height: Style.space(40)
+
+                  Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width
+                    height: 1
+                    color: Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.10)
+                  }
 
                   Row {
                     id: subBars
@@ -523,12 +556,13 @@ BarWidget {
                         width: subBars.bW
                         height: subBars.height
 
+                        // 悬停高亮整条轨道，非悬停极淡底色，避免无数据列抢眼
                         Rectangle {
                           anchors.fill: parent
                           radius: Style.space(1)
                           color: (root.hoveredModelIdx === mCard.index && root.hoveredSlotIdx === sItem.index)
-                            ? Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.18)
-                            : Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.05)
+                            ? Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.16)
+                            : Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.025)
                         }
 
                         Rectangle {
@@ -540,9 +574,9 @@ BarWidget {
                           radius: Style.space(1)
                           color: sItem.modelData.hasData
                             ? String(mCard.modelData.color || "#00e5ff")
-                            : Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.16)
+                            : Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.14)
                           opacity: sItem.modelData.hasData
-                            ? ((root.hoveredModelIdx === mCard.index && root.hoveredSlotIdx === sItem.index) ? 1.0 : 0.86)
+                            ? ((root.hoveredModelIdx === mCard.index && root.hoveredSlotIdx === sItem.index) ? 1.0 : 0.88)
                             : 1.0
                         }
 
@@ -573,7 +607,7 @@ BarWidget {
                     color: root.mutedColor
                     font.family: root.uiFont
                     font.pixelSize: Style.font.caption
-                    width: parent.width * 0.55
+                    width: parent.width * 0.52
                     elide: Text.ElideRight
                   }
                   Text {
@@ -585,7 +619,7 @@ BarWidget {
                     font.family: root.uiFont
                     font.pixelSize: Style.font.caption
                     horizontalAlignment: Text.AlignRight
-                    width: parent.width * 0.45
+                    width: parent.width * 0.48
                     elide: Text.ElideLeft
                   }
                 }
@@ -596,12 +630,18 @@ BarWidget {
       }
 
       PanelSeparator {
+        width: parent.width
         foreground: root.fgColor
+        strength: 0.22
       }
 
+      // 全部活跃模型列表 (精确锁定 3 整行高度 + 右侧滚动滑块，彻底消灭半行腰斩)
       Column {
         width: parent.width
-        spacing: Style.space(4)
+        spacing: Style.space(5)
+
+        readonly property real itemH: Style.space(42)
+        readonly property real itemGap: Style.space(4)
 
         Row {
           width: parent.width
@@ -616,7 +656,7 @@ BarWidget {
           }
           Text {
             textFormat: Text.PlainText
-            text: "共 " + String(root.stats.models ? root.stats.models.length : 0) + " 个 (可滚轮)"
+            text: "共 " + String(root.stats.models ? root.stats.models.length : 0) + " 个 (滚轮翻页)"
             color: root.mutedColor
             font.family: root.uiFont
             font.pixelSize: Style.font.caption
@@ -625,99 +665,134 @@ BarWidget {
           }
         }
 
-        Flickable {
+        Item {
+          id: listViewport
           visible: root.stats.models && root.stats.models.length > 0
           width: parent.width
-          height: Math.min(modelListCol.implicitHeight, Style.space(145))
-          contentWidth: width
-          contentHeight: modelListCol.implicitHeight
-          clip: true
-          boundsBehavior: Flickable.StopAtBounds
+          readonly property int totalItems: root.stats.models ? root.stats.models.length : 0
+          readonly property int visibleRows: Math.min(3, totalItems)
+          readonly property bool canScroll: totalItems > 3
+          height: visibleRows > 0 ? (visibleRows * parent.itemH + (visibleRows - 1) * parent.itemGap) : 0
 
-          Column {
-            id: modelListCol
-            width: parent.width
-            spacing: Style.space(4)
+          Flickable {
+            id: modelFlick
+            anchors.left: parent.left
+            anchors.right: listViewport.canScroll ? scrollTrack.left : parent.right
+            anchors.rightMargin: listViewport.canScroll ? Style.space(5) : 0
+            height: parent.height
+            contentWidth: width
+            contentHeight: modelListCol.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
 
-            Repeater {
-              model: root.stats.models || []
+            Column {
+              id: modelListCol
+              width: modelFlick.width
+              spacing: Style.space(4)
 
-              BorderSurface {
-                required property var modelData
-                width: modelListCol.width
-                height: modelInner.implicitHeight + Style.space(8)
-                radius: Style.spacing.labelGap
-                color: Style.normalFillFor(root.fgColor)
-                borderSpec: Border.controlSpec("normal", root.fgColor, root.accentColor)
+              Repeater {
+                model: root.stats.models || []
 
-                Column {
-                  id: modelInner
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  anchors.leftMargin: Style.space(8)
-                  anchors.rightMargin: Style.space(8)
-                  spacing: Style.space(2)
+                BorderSurface {
+                  required property var modelData
+                  width: modelListCol.width
+                  height: Style.space(42)
+                  radius: Style.spacing.labelGap
+                  color: Style.normalFillFor(root.fgColor, root.accentColor)
+                  borderSpec: Border.controlSpec("normal", root.fgColor, root.accentColor)
 
-                  Row {
-                    width: parent.width
+                  Column {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: Style.space(8)
+                    anchors.rightMargin: Style.space(8)
+                    spacing: Style.space(2)
+
+                    Row {
+                      width: parent.width
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: String(modelData.name || "")
+                        color: root.fgColor
+                        font.family: root.uiFont
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        elide: Text.ElideRight
+                        width: parent.width - costLabel.implicitWidth - hitBadge.implicitWidth - Style.space(14)
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        id: hitBadge
+                        textFormat: Text.PlainText
+                        text: "缓存 " + Number(modelData.hitRate || 0).toFixed(1) + "%"
+                        color: root.hitColor(Number(modelData.hitRate || 0))
+                        font.family: root.uiFont
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Item { width: Style.space(8); height: 1 }
+
+                      Text {
+                        id: costLabel
+                        textFormat: Text.PlainText
+                        text: "$" + Number(modelData.cost || 0).toFixed(2)
+                        color: root.fgColor
+                        font.family: root.uiFont
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
 
                     Text {
                       textFormat: Text.PlainText
-                      text: String(modelData.name || "")
-                      color: root.fgColor
+                      text: String(modelData.calls || 0) + " 次 · " + String(modelData.totalShort || "0")
+                        + " (缓存 " + String(modelData.cachedShort || "0")
+                        + " / 输入 " + String(modelData.uncachedShort || "0")
+                        + " / 输出 " + String(modelData.outputShort || "0") + ")"
+                      color: root.mutedColor
                       font.family: root.uiFont
                       font.pixelSize: Style.font.caption
-                      font.bold: true
                       elide: Text.ElideRight
-                      width: parent.width - costLabel.implicitWidth - hitBadge.implicitWidth - Style.space(14)
-                      anchors.verticalCenter: parent.verticalCenter
+                      width: parent.width
                     }
-
-                    Text {
-                      id: hitBadge
-                      textFormat: Text.PlainText
-                      text: "缓存 " + Number(modelData.hitRate || 0).toFixed(1) + "%"
-                      color: root.hitColor(Number(modelData.hitRate || 0))
-                      font.family: root.uiFont
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                      anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    Item { width: Style.space(8); height: 1 }
-
-                    Text {
-                      id: costLabel
-                      textFormat: Text.PlainText
-                      text: "$" + Number(modelData.cost || 0).toFixed(2)
-                      color: root.fgColor
-                      font.family: root.uiFont
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                      anchors.verticalCenter: parent.verticalCenter
-                    }
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: String(modelData.calls || 0) + " 次 · " + String(modelData.totalShort || "0")
-                      + " (缓存 " + String(modelData.cachedShort || "0")
-                      + " / 输入 " + String(modelData.uncachedShort || "0")
-                      + " / 输出 " + String(modelData.outputShort || "0") + ")"
-                    color: root.mutedColor
-                    font.family: root.uiFont
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                    width: parent.width
                   }
                 }
               }
             }
           }
+
+          // 右侧细长滚动进度指示条
+          Rectangle {
+            id: scrollTrack
+            visible: listViewport.canScroll
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: Style.space(4)
+            radius: Style.space(2)
+            color: Qt.rgba(root.fgColor.r, root.fgColor.g, root.fgColor.b, 0.08)
+
+            Rectangle {
+              width: parent.width
+              radius: parent.radius
+              color: Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.55)
+              readonly property real ratio: modelFlick.contentHeight > 0 ? Math.min(1.0, modelFlick.height / modelFlick.contentHeight) : 1.0
+              height: Math.max(Style.space(16), parent.height * ratio)
+              y: modelFlick.contentHeight > modelFlick.height
+                ? (modelFlick.contentY / (modelFlick.contentHeight - modelFlick.height)) * (parent.height - height)
+                : 0
+            }
+          }
         }
       }
 
+      // 底部来源与操作按钮
       Row {
         width: parent.width
         spacing: Style.space(8)
