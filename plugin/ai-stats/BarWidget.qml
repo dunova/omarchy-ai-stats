@@ -15,7 +15,7 @@ BarWidget {
   property bool popupOpen: false
   property string selectedRange: "24h"
   property string barDisplayText: "󰧑 $0.00 · 0%"
-  property string barTooltipText: "过去 24 小时模型用量与缓存监控\n左键点击展开或收回详情卡片"
+  property string barTooltipText: "左键点击展开图表卡片 · 右键刷新"
   property bool pendingRefresh: false
   property int hoveredModelIdx: -1
   property int hoveredSlotIdx: -1
@@ -52,13 +52,14 @@ BarWidget {
     popupOpen = false
   }
 
-  function refreshStats() {
+  function refreshStats(forceFresh) {
     if (statsProc.running) {
       root.pendingRefresh = true
       return
     }
     root.pendingRefresh = false
-    statsProc.command = ["bash", "-c", "exec \"$HOME/.local/bin/omarchy-ai-stats\" --json-detail --range \"$1\"", "stats", root.selectedRange]
+    var extra = forceFresh ? " --no-cache" : ""
+    statsProc.command = ["bash", "-c", "exec \"$HOME/.local/bin/omarchy-ai-stats\" --json-detail --range \"$1\"" + extra, "stats", root.selectedRange]
     statsProc.running = true
   }
 
@@ -71,7 +72,6 @@ BarWidget {
       }
       root.stats = parsed
       if (parsed.barText) root.barDisplayText = parsed.barText
-      if (parsed.tooltip) root.barTooltipText = parsed.tooltip
     } catch (e) {}
   }
 
@@ -92,7 +92,7 @@ BarWidget {
     }
     onExited: function() {
       if (root.pendingRefresh) {
-        root.refreshStats()
+        root.refreshStats(false)
       }
     }
   }
@@ -102,7 +102,7 @@ BarWidget {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.refreshStats()
+    onTriggered: root.refreshStats(false)
   }
 
   WidgetButton {
@@ -110,17 +110,17 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: root.barDisplayText
-    tooltipText: root.barTooltipText
+    tooltipText: root.popupOpen ? "" : root.barTooltipText
     active: root.popupOpen
     onPressed: function(mouseButton) {
       if (mouseButton === Qt.RightButton) {
-        root.refreshStats()
+        root.refreshStats(true)
       } else {
         root.popupOpen = !root.popupOpen
         if (root.popupOpen) {
           root.hoveredModelIdx = -1
           root.hoveredSlotIdx = -1
-          root.refreshStats()
+          root.refreshStats(true)
         }
       }
     }
@@ -198,7 +198,7 @@ BarWidget {
                   root.selectedRange = modelData.key
                   root.hoveredModelIdx = -1
                   root.hoveredSlotIdx = -1
-                  root.refreshStats()
+                  root.refreshStats(false)
                 }
               }
             }
@@ -747,7 +747,7 @@ BarWidget {
             fontSize: Style.font.caption
             horizontalPadding: Style.space(8)
             verticalPadding: Style.space(4)
-            onClicked: root.refreshStats()
+            onClicked: root.refreshStats(true)
           }
 
           Button {

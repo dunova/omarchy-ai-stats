@@ -70,6 +70,7 @@ FALLBACK_PRICE = [1.00, 0.10, 0.00, 5.00]
 
 CONFIG_DIR = Path.home() / ".config/omarchy-ai-stats"
 PRICING_FILE = CONFIG_DIR / "pricing.json"
+CACHE_DIR = Path.home() / ".cache/omarchy-ai-stats"
 CUSTOM_LOG = Path.home() / ".local/share/ai-usage/events.jsonl"
 CLAUDE_GLOB = str(Path.home() / ".claude/projects/**/*.jsonl")
 CODEX_GLOB = str(Path.home() / ".codex/sessions/**/*.jsonl")
@@ -1007,20 +1008,9 @@ def build_detail_payload(range_key: str = "24h", demo: bool = False) -> dict:
         })
 
     tooltip_lines = [
-        f"过去 24 小时模型用量 ({len(agg_24h['by_model'])} 个模型)",
-        "────────────────────────────",
-        f"等效估值: ${agg_24h['cost']:.2f}",
-        f"缓存命中: {agg_24h['hit_rate']:.1f}%",
-        f"调用次数: {agg_24h['calls']} 次",
-        f"Token 总量: {fmt_short(agg_24h['total'])} (输入: {fmt_short(agg_24h['cached'] + agg_24h['uncached'])}, 输出: {fmt_short(agg_24h['output'])})",
+        f"过去 24 小时: ${agg_24h['cost']:.2f} · 平均缓存 {agg_24h['hit_rate']:.1f}% · {agg_24h['calls']} 次调用",
+        "左键点击展开或收回详情卡片 · 右键立即刷新",
     ]
-    if agg_24h["by_model"]:
-        tooltip_lines.append("")
-        for m, d in list(agg_24h["by_model"].items())[:6]:
-            m_in = d["cached"] + d["uncached"] + d["cache_write"]
-            hr = (d["cached"] / m_in * 100.0) if m_in > 0 else 0.0
-            tooltip_lines.append(f"• {m}: ${d['cost']:.2f} (缓存 {hr:.1f}%)")
-    tooltip_lines.append("\n左键点击展开或收回详情卡片")
 
     source_names_cn = {
         "antigravity": "Antigravity",
@@ -1166,6 +1156,7 @@ def main():
     parser = argparse.ArgumentParser(description="Omarchy AI 模型用量与 Prompt Caching 监控工具")
     parser.add_argument("--waybar", action="store_true", help="输出 Waybar JSON 状态")
     parser.add_argument("--json-detail", action="store_true", help="输出供原生插件卡片使用的详细 JSON")
+    parser.add_argument("--no-cache", action="store_true", help="跳过短期缓存强制重新扫描数据库")
     parser.add_argument("--range", choices=["1h", "24h", "7d"], default="24h", help="统计时间范围 (默认 24h)")
     parser.add_argument("--check", action="store_true", help="运行本机日志源与配置自检")
     parser.add_argument("--demo", action="store_true", help="使用模拟数据进行预览")
@@ -1174,7 +1165,25 @@ def main():
     if args.waybar:
         run_waybar(demo=args.demo)
     elif args.json_detail:
-        print(json.dumps(build_detail_payload(range_key=args.range, demo=args.demo), ensure_ascii=False))
+        cache_file = CACHE_DIR / f"detail-{args.range}.json"
+        if not args.demo and not args.no_cache and cache_file.exists():
+            try:
+                if time.time() - cache_file.stat().st_mtime < 8.0:
+                    print(cache_file.read_text(encoding="utf-8"))
+                    return
+            except Exception:
+                pass
+        payload = build_detail_payload(range_key=args.range, demo=args.demo)
+        out_str = json.dumps(payload, ensure_ascii=False)
+        if not args.demo:
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp_file = CACHE_DIR / f"detail-{args.range}.json.tmp"
+                tmp_file.write_text(out_str, encoding="utf-8")
+                tmp_file.replace(cache_file)
+            except Exception:
+                pass
+        print(out_str)
     elif args.check:
         run_check()
     else:
