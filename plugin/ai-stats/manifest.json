@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "dunova.ai-stats",
+  "name": "AI 模型用量与缓存",
+  "version": "0.1.0",
+  "author": "dunova",
+  "description": "Live AI model token cost and Prompt Caching hit rate monitor",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Stats",
+    "description": "实时监控过去 24 小时 AI 模型费用与缓存命中率，支持点击弹出与收回卡片",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

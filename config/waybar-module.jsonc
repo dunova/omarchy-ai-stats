@@ -1,0 +1,8 @@
+// Add "custom/ai-usage" into "modules-right" in ~/.config/waybar/config.jsonc
+"custom/ai-usage": {
+  "exec": "$HOME/.local/bin/omarchy-ai-stats --waybar",
+  "return-type": "json",
+  "interval": 15,
+  "tooltip": true,
+  "on-click": "xdg-terminal-exec --app-id=org.omarchy.ai-usage -e $HOME/.local/bin/omarchy-ai-stats"
+}

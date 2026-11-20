@@ -1,0 +1,1185 @@
+#!/usr/bin/env python3
+"""
+omarchy-ai-stats: Omarchy 原生 AI 模型用量、费用与 Prompt Caching 命中率监控工具
+支持:
+- Antigravity IDE 与 CLI 会话数据库 (~/.gemini/antigravity/conversations/*.db)
+- OMP (oh-my-pi), Devin CLI, Claude Code, Codex CLI, OpenCode, Pi 及自定义 JSONL
+- Omarchy Shell 原生插件详细 JSON 输出 (--json-detail, 含前 4 模型分立走势)
+- 全中文交互式终端仪表盘 (默认过去 24 小时, 底部 4 模型分窗走势)
+"""
+
+import argparse
+import glob
+import json
+import os
+import select
+import shutil
+import sqlite3
+import sys
+import termios
+import time
+import tty
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+# 权威模型单价 (美元 / 百万 Token): [未缓存输入, 缓存读取输入, 缓存写入输入, 生成输出]
+DEFAULT_PRICING = {
+    "gemini-4-hydrogen": [1.50, 0.075, 0.00, 7.50],
+    "gemini-4-neon": [3.00, 0.15, 0.00, 15.00],
+    "gemini-4-argon": [2.00, 0.10, 0.00, 10.00],
+    "gemini-4-carbon": [2.00, 0.10, 0.00, 10.00],
+    "orchestrator-(neon)": [3.00, 0.15, 0.00, 15.00],
+    "orchestrator-(argon)": [2.00, 0.10, 0.00, 10.00],
+    "gemini-3.8-flash": [0.75, 0.075, 0.00, 3.75],
+    "gemini-3.5-flash": [1.50, 0.15, 0.00, 9.00],
+    "gemini-3-flash": [0.50, 0.05, 0.00, 3.00],
+    "gemini-3.1-pro": [2.00, 0.20, 0.00, 12.00],
+    "gemini-2.5-pro": [1.25, 0.31, 1.56, 10.00],
+    "gemini-2.5-flash": [0.15, 0.0375, 0.19, 0.60],
+    "claude-opus-5.5": [4.00, 0.20, 5.00, 20.00],
+    "claude-opus-5-5": [4.00, 0.20, 5.00, 20.00],
+    "claude-opus": [5.00, 0.50, 6.25, 25.00],
+    "claude-sonnet": [3.00, 0.30, 3.75, 15.00],
+    "claude-haiku": [1.00, 0.10, 1.25, 5.00],
+    "deepseek": [0.27, 0.07, 0.27, 1.10],
+    "glm": [0.50, 0.10, 0.50, 2.00],
+    "gpt-6": [2.00, 0.20, 2.50, 10.00],
+    "gpt-5.4": [2.50, 0.25, 0.00, 15.00],
+    "gpt-5": [2.50, 0.25, 0.00, 15.00],
+    "codex": [1.75, 0.175, 0.00, 14.00],
+    "swe-2-flash": [0.10, 0.01, 0.125, 0.50],
+    "swe-2-max": [0.50, 0.05, 0.00, 2.50],
+    "swe-2-high": [0.50, 0.05, 0.00, 2.50],
+    "swe-2": [0.50, 0.05, 0.00, 2.50],
+    "compactor": [0.10, 0.01, 0.00, 0.50],
+}
+FALLBACK_PRICE = [1.00, 0.10, 0.00, 5.00]
+
+CONFIG_DIR = Path.home() / ".config/omarchy-ai-stats"
+PRICING_FILE = CONFIG_DIR / "pricing.json"
+CUSTOM_LOG = Path.home() / ".local/share/ai-usage/events.jsonl"
+CLAUDE_GLOB = str(Path.home() / ".claude/projects/**/*.jsonl")
+CODEX_GLOB = str(Path.home() / ".codex/sessions/**/*.jsonl")
+PI_GLOB = str(Path.home() / ".pi/agent/sessions/**/*.jsonl")
+OMP_DB = Path.home() / ".omp/stats.db"
+DEVIN_DB = Path.home() / ".local/share/devin/cli/sessions.db"
+AGY_CONV_GLOBS = [
+    str(Path.home() / ".gemini/antigravity/conversations/*.db"),
+    str(Path.home() / ".gemini/antigravity-cli/conversations/*.db"),
+]
+OPENCODE_DB_CANDIDATES = [
+    Path.home() / ".local/share/opencode/opencode.db",
+    Path.home() / ".opencode/opencode.db",
+]
+
+
+def load_pricing() -> dict:
+    pricing = dict(DEFAULT_PRICING)
+    if PRICING_FILE.exists():
+        try:
+            user_pricing = json.loads(PRICING_FILE.read_text(encoding="utf-8"))
+            if isinstance(user_pricing, dict):
+                for k, v in user_pricing.items():
+                    if isinstance(v, list) and len(v) == 4:
+                        pricing[k.lower().replace(" ", "-")] = [float(x) for x in v]
+        except Exception:
+            pass
+    return dict(sorted(pricing.items(), key=lambda kv: len(kv[0]), reverse=True))
+
+
+MODEL_PRICING = load_pricing()
+
+
+def get_pricing(model: str):
+    m = (model or "").lower().replace(" ", "-")
+    for key, price in MODEL_PRICING.items():
+        if key in m:
+            return price
+    return FALLBACK_PRICE
+
+
+def calc_cost(model: str, uncached: int, cached: int, cache_write: int, output: int, explicit_cost=None) -> float:
+    if explicit_cost is not None and explicit_cost > 0:
+        return float(explicit_cost)
+    p_in, p_cache, p_cw, p_out = get_pricing(model)
+    return (uncached * p_in + cached * p_cache + cache_write * p_cw + output * p_out) / 1_000_000.0
+
+
+def parse_ts(val):
+    if val is None or val == "":
+        return None
+    try:
+        if isinstance(val, (int, float)):
+            ts_val = val / 1000.0 if val > 1e12 else float(val)
+            return datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone()
+        s = str(val).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return dt.astimezone()
+    except Exception:
+        return None
+
+
+def _pb_iter(data: bytes):
+    """轻量零依赖 Protobuf Wire Format 迭代解码器"""
+    i = 0
+    n = len(data)
+    while i < n:
+        tag = 0
+        shift = 0
+        while i < n:
+            b = data[i]
+            i += 1
+            tag |= (b & 0x7F) << shift
+            if not (b & 0x80):
+                break
+            shift += 7
+        fn = tag >> 3
+        wt = tag & 7
+        if wt == 0:
+            v = 0
+            s = 0
+            while i < n:
+                b = data[i]
+                i += 1
+                v |= (b & 0x7F) << s
+                if not (b & 0x80):
+                    break
+                s += 7
+            yield fn, wt, v
+        elif wt == 1:
+            if i + 8 > n:
+                break
+            yield fn, wt, int.from_bytes(data[i:i + 8], "little")
+            i += 8
+        elif wt == 2:
+            l = 0
+            s = 0
+            while i < n:
+                b = data[i]
+                i += 1
+                l |= (b & 0x7F) << s
+                if not (b & 0x80):
+                    break
+                s += 7
+            if i + l > n:
+                break
+            yield fn, wt, data[i:i + l]
+            i += l
+        elif wt == 5:
+            if i + 4 > n:
+                break
+            yield fn, wt, int.from_bytes(data[i:i + 4], "little")
+            i += 4
+        else:
+            break
+
+
+def load_antigravity_events(since: datetime) -> list:
+    """
+    直接解析 Antigravity IDE 与 CLI 会话库中的 gen_metadata 与步骤时间戳:
+    - mfn == 2: 未缓存输入 Token (input_tokens)
+    - mfn == 3: 总生成与思考输出 Token (output_tokens, 等于 response + thinking)
+    - mfn == 5: 缓存命中读取 Token (cache_read_input_tokens)
+    """
+    events = []
+    since_sec = since.timestamp()
+    seen_paths = set()
+    for pattern in AGY_CONV_GLOBS:
+        for path in glob.glob(pattern):
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            try:
+                mtime = os.path.getmtime(path)
+                wal_path = path + "-wal"
+                if os.path.exists(wal_path):
+                    mtime = max(mtime, os.path.getmtime(wal_path))
+                if mtime < since_sec:
+                    continue
+
+                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+                gen_ts = {}
+                for (step_meta,) in conn.execute("SELECT metadata FROM steps WHERE metadata IS NOT NULL"):
+                    ts_val = None
+                    g_idx = None
+                    for fn, wt, val in _pb_iter(step_meta):
+                        if fn == 1 and wt == 2:
+                            for sfn, swt, sval in _pb_iter(val):
+                                if sfn == 1 and swt == 0:
+                                    ts_val = sval
+                                    break
+                        elif fn == 20 and wt == 2:
+                            for sfn, swt, sval in _pb_iter(val):
+                                if sfn == 3 and swt == 0:
+                                    g_idx = sval
+                    if g_idx is not None and ts_val is not None:
+                        if g_idx not in gen_ts or ts_val < gen_ts[g_idx]:
+                            gen_ts[g_idx] = ts_val
+
+                for g_idx, blob in conn.execute("SELECT idx, data FROM gen_metadata"):
+                    ts_val = gen_ts.get(g_idx)
+                    if not ts_val or ts_val < since_sec:
+                        continue
+                    m19 = ""
+                    m21 = ""
+                    inp = 0
+                    out = 0
+                    cached = 0
+                    for fn, wt, val in _pb_iter(blob):
+                        if fn == 1 and wt == 2:
+                            for sfn, swt, sval in _pb_iter(val):
+                                if sfn == 19 and swt == 2:
+                                    m19 = sval.decode("utf-8", "ignore")
+                                elif sfn == 21 and swt == 2:
+                                    m21 = sval.decode("utf-8", "ignore")
+                                elif sfn == 4 and swt == 2:
+                                    for mfn, mwt, mval in _pb_iter(sval):
+                                        if mfn == 2 and mwt == 0:
+                                            inp = mval
+                                        elif mfn == 3 and mwt == 0:
+                                            out = mval
+                                        elif mfn == 5 and mwt == 0:
+                                            cached = mval
+                    model = m21 or m19
+                    if not model or not (inp or out or cached):
+                        continue
+                    ts = parse_ts(ts_val)
+                    if not ts or ts < since:
+                        continue
+                    events.append({
+                        "ts": ts,
+                        "model": model,
+                        "uncached": inp,
+                        "cached": cached,
+                        "cache_write": 0,
+                        "output": out,
+                        "cost": None,
+                        "source": "antigravity",
+                    })
+                conn.close()
+            except Exception:
+                continue
+    return events
+
+
+def generate_demo_events() -> list:
+    now = datetime.now().astimezone()
+    events = []
+    # 为前 4 名模型生成连续 24 小时的拟真波动数据，便于预览与演示
+    model_profiles = [
+        ("Gemini 4 Hydrogen (High)", [62, 68, 74, 82, 88, 91, 93, 94, 92, 85, 72, 79, 88, 93, 95, 96, 94, 91, 89, 93, 95, 96, 97, 96], 240_000, 1450),
+        ("Gemini 4 Hydrogen (Orchestrator)", [80, 84, 88, 90, 92, 94, 95, 93, 91, 92, 94, 95, 96, 93, 90, 92, 94, 95, 96, 95, 94, 95, 96, 95], 190_000, 980),
+        ("Gemini 4 Neon (High)", [55, 60, 70, 85, 90, 92, 88, 76, 65, 78, 86, 91, 93, 94, 92, 89, 84, 88, 92, 95, 94, 93, 95, 94], 150_000, 1120),
+        ("Gemini 3.8 Flash (High)", [85, 88, 91, 93, 95, 96, 97, 96, 94, 95, 96, 97, 98, 97, 96, 95, 96, 97, 98, 97, 96, 97, 98, 97], 95_000, 620),
+    ]
+    end_hour = now.replace(minute=30, second=0, microsecond=0)
+    for m_name, rates, base_total_in, base_out in model_profiles:
+        for h_idx, rate in enumerate(rates):
+            t = end_hour - timedelta(hours=23 - h_idx)
+            if t > now:
+                t = now - timedelta(minutes=2)
+            cached = int(base_total_in * (rate / 100.0))
+            uncached = max(500, base_total_in - cached)
+            events.append({
+                "ts": t,
+                "model": m_name,
+                "cached": cached,
+                "uncached": uncached,
+                "cache_write": 0,
+                "output": base_out,
+                "cost": None,
+                "source": "demo",
+            })
+    return events
+
+
+def load_claude_events(since: datetime) -> list:
+    events = []
+    seen_ids = set()
+    for path in glob.glob(CLAUDE_GLOB, recursive=True):
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(path)).astimezone() < since:
+                continue
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    msg = obj.get("message") or {}
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    req_id = obj.get("requestId") or msg.get("id")
+                    if req_id and req_id in seen_ids:
+                        continue
+                    ts = parse_ts(obj.get("timestamp"))
+                    if not ts or ts < since:
+                        continue
+                    if req_id:
+                        seen_ids.add(req_id)
+                    events.append({
+                        "ts": ts,
+                        "model": msg.get("model", "claude-unknown"),
+                        "uncached": int(usage.get("input_tokens", 0) or 0),
+                        "cached": int(usage.get("cache_read_input_tokens", 0) or 0),
+                        "cache_write": int(usage.get("cache_creation_input_tokens", 0) or 0),
+                        "output": int(usage.get("output_tokens", 0) or 0),
+                        "cost": None,
+                        "source": "claude-code",
+                    })
+        except Exception:
+            continue
+    return events
+
+
+def load_codex_events(since: datetime) -> list:
+    events = []
+    for path in glob.glob(CODEX_GLOB, recursive=True):
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(path)).astimezone() < since:
+                continue
+            current_model = "codex"
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "token_count" not in line and "model" not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    payload = obj.get("payload") or {}
+                    if isinstance(payload, dict) and payload.get("model"):
+                        current_model = str(payload["model"])
+                    if obj.get("type") == "event_msg" and payload.get("type") == "token_count":
+                        info = payload.get("info") or {}
+                        last = info.get("last_token_usage") or {}
+                        if not last:
+                            continue
+                        ts = parse_ts(obj.get("timestamp"))
+                        if not ts or ts < since:
+                            continue
+                        total_in = int(last.get("input_tokens", 0) or 0)
+                        cached = int(last.get("cached_input_tokens", 0) or 0)
+                        uncached = max(0, total_in - cached)
+                        output = int(last.get("output_tokens", 0) or 0)
+                        events.append({
+                            "ts": ts,
+                            "model": current_model,
+                            "uncached": uncached,
+                            "cached": cached,
+                            "cache_write": 0,
+                            "output": output,
+                            "cost": None,
+                            "source": "codex",
+                        })
+        except Exception:
+            continue
+    return events
+
+
+def load_opencode_events(since: datetime) -> list:
+    events = []
+    for db_path in OPENCODE_DB_CANDIDATES:
+        if not db_path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            cur = conn.cursor()
+            tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "message" in tables:
+                cols = {r[1] for r in cur.execute("PRAGMA table_info(message)")}
+                if {"data", "time_created"}.issubset(cols):
+                    since_ms = int(since.timestamp() * 1000)
+                    for data_str, t_created in cur.execute(
+                        "SELECT data, time_created FROM message WHERE time_created >= ?", (since_ms,)
+                    ):
+                        try:
+                            d = json.loads(data_str)
+                            tokens = d.get("tokens") or {}
+                            if not tokens:
+                                continue
+                            cache = tokens.get("cache") or {}
+                            ts = parse_ts(t_created)
+                            if not ts or ts < since:
+                                continue
+                            model = d.get("modelID") or d.get("model") or "opencode"
+                            events.append({
+                                "ts": ts,
+                                "model": str(model),
+                                "uncached": int(tokens.get("input", 0) or 0),
+                                "cached": int(cache.get("read", 0) or 0),
+                                "cache_write": int(cache.get("write", 0) or 0),
+                                "output": int(tokens.get("output", 0) or 0),
+                                "cost": None,
+                                "source": "opencode",
+                            })
+                        except Exception:
+                            continue
+            conn.close()
+        except Exception:
+            continue
+    return events
+
+
+def load_omp_events(since: datetime) -> list:
+    events = []
+    if not OMP_DB.exists():
+        return events
+    try:
+        conn = sqlite3.connect(f"file:{OMP_DB}?mode=ro", uri=True, timeout=1.5)
+        since_ms = int(since.timestamp() * 1000)
+        rows = conn.execute(
+            "SELECT timestamp, model, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_total "
+            "FROM messages WHERE timestamp >= ?",
+            (since_ms,),
+        )
+        for ts_ms, model, inp, cache_r, cache_w, out, cost_total in rows:
+            ts = parse_ts(ts_ms)
+            if not ts or ts < since:
+                continue
+            events.append({
+                "ts": ts,
+                "model": str(model or "omp-unknown"),
+                "uncached": int(inp or 0),
+                "cached": int(cache_r or 0),
+                "cache_write": int(cache_w or 0),
+                "output": int(out or 0),
+                "cost": float(cost_total) if cost_total else None,
+                "source": "omp",
+            })
+        conn.close()
+    except Exception:
+        pass
+    return events
+
+
+def load_devin_events(since: datetime) -> list:
+    events = []
+    if not DEVIN_DB.exists():
+        return events
+    try:
+        conn = sqlite3.connect(f"file:{DEVIN_DB}?mode=ro", uri=True, timeout=1.5)
+        since_sec = since.timestamp()
+        seen = set()
+        rows = conn.execute(
+            "SELECT session_id, created_at, chat_message FROM message_nodes "
+            "WHERE created_at >= ? AND chat_message LIKE '%\"metrics\"%'",
+            (since_sec,),
+        )
+        for sid, created_at, raw in rows:
+            try:
+                obj = json.loads(raw)
+                meta = obj.get("metadata") or {}
+                metrics = meta.get("metrics")
+                if not isinstance(metrics, dict):
+                    continue
+                ts = parse_ts(created_at)
+                if not ts or ts < since:
+                    continue
+                model = str(meta.get("generation_model") or "devin")
+                inp = int(metrics.get("input_tokens") or 0)
+                out = int(metrics.get("output_tokens") or 0)
+                cache_r = int(metrics.get("cache_read_tokens") or 0)
+                cache_w = int(metrics.get("cache_creation_tokens") or 0)
+                dedup_key = (
+                    sid, created_at, model,
+                    metrics.get("ttft_ms"), metrics.get("total_time_ms"),
+                    inp, out, cache_r
+                )
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                events.append({
+                    "ts": ts,
+                    "model": model,
+                    "uncached": inp,
+                    "cached": cache_r,
+                    "cache_write": cache_w,
+                    "output": out,
+                    "cost": None,
+                    "source": "devin-cli",
+                })
+            except Exception:
+                continue
+        conn.close()
+    except Exception:
+        pass
+    return events
+
+
+def load_pi_events(since: datetime) -> list:
+    events = []
+    for path in glob.glob(PI_GLOB, recursive=True):
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(path)).astimezone() < since:
+                continue
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    msg = obj.get("message") or obj
+                    usage = msg.get("usage") if isinstance(msg, dict) else None
+                    if not isinstance(usage, dict):
+                        continue
+                    ts = parse_ts(obj.get("timestamp") or msg.get("timestamp"))
+                    if not ts or ts < since:
+                        continue
+                    model = str(msg.get("model") or obj.get("model") or "pi")
+                    inp = int(usage.get("input", usage.get("input_tokens", 0)) or 0)
+                    cache_r = int(usage.get("cacheRead", usage.get("cache_read_input_tokens", 0)) or 0)
+                    cache_w = int(usage.get("cacheWrite", usage.get("cache_creation_input_tokens", 0)) or 0)
+                    out = int(usage.get("output", usage.get("output_tokens", 0)) or 0)
+                    cost_obj = usage.get("cost")
+                    explicit_cost = None
+                    if isinstance(cost_obj, dict) and "total" in cost_obj:
+                        explicit_cost = float(cost_obj["total"])
+                    elif isinstance(cost_obj, (int, float)):
+                        explicit_cost = float(cost_obj)
+                    events.append({
+                        "ts": ts,
+                        "model": model,
+                        "uncached": inp,
+                        "cached": cache_r,
+                        "cache_write": cache_w,
+                        "output": out,
+                        "cost": explicit_cost,
+                        "source": "pi",
+                    })
+        except Exception:
+            continue
+    return events
+
+
+def load_custom_events(since: datetime) -> list:
+    events = []
+    if not CUSTOM_LOG.exists():
+        return events
+    try:
+        with open(CUSTOM_LOG, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                ts = parse_ts(obj.get("ts") or obj.get("timestamp"))
+                if not ts or ts < since:
+                    continue
+                events.append({
+                    "ts": ts,
+                    "model": str(obj.get("model", "unknown")),
+                    "uncached": int(obj.get("uncached", obj.get("input_tokens", 0)) or 0),
+                    "cached": int(obj.get("cached", obj.get("cache_read_input_tokens", 0)) or 0),
+                    "cache_write": int(obj.get("cache_write", obj.get("cache_creation_input_tokens", 0)) or 0),
+                    "output": int(obj.get("output", obj.get("output_tokens", 0)) or 0),
+                    "cost": float(obj["cost"]) if "cost" in obj and obj["cost"] is not None else None,
+                    "source": obj.get("source", "custom"),
+                })
+    except Exception:
+        pass
+    return events
+
+
+def load_events(since: datetime, demo: bool = False) -> list:
+    if demo:
+        return generate_demo_events()
+    events = []
+    events.extend(load_antigravity_events(since))
+    events.extend(load_omp_events(since))
+    events.extend(load_devin_events(since))
+    events.extend(load_claude_events(since))
+    events.extend(load_codex_events(since))
+    events.extend(load_opencode_events(since))
+    events.extend(load_pi_events(since))
+    events.extend(load_custom_events(since))
+    events.sort(key=lambda e: e["ts"])
+    return events
+
+
+def aggregate(events: list) -> dict:
+    tot_cached = sum(e["cached"] for e in events)
+    tot_uncached = sum(e["uncached"] for e in events)
+    tot_cw = sum(e["cache_write"] for e in events)
+    tot_out = sum(e["output"] for e in events)
+    tot_all = tot_cached + tot_uncached + tot_cw + tot_out
+    tot_in = tot_cached + tot_uncached + tot_cw
+    hit_rate = (tot_cached / tot_in * 100.0) if tot_in > 0 else 0.0
+
+    by_model = defaultdict(lambda: {"cached": 0, "uncached": 0, "cache_write": 0, "output": 0, "cost": 0.0, "calls": 0})
+    sources = set()
+    for e in events:
+        sources.add(e.get("source", "unknown"))
+        m = by_model[e["model"]]
+        m["cached"] += e["cached"]
+        m["uncached"] += e["uncached"]
+        m["cache_write"] += e["cache_write"]
+        m["output"] += e["output"]
+        m["calls"] += 1
+        m["cost"] += calc_cost(e["model"], e["uncached"], e["cached"], e["cache_write"], e["output"], e.get("cost"))
+
+    tot_cost = sum(v["cost"] for v in by_model.values())
+    return {
+        "cached": tot_cached,
+        "uncached": tot_uncached,
+        "cache_write": tot_cw,
+        "output": tot_out,
+        "total": tot_all,
+        "hit_rate": hit_rate,
+        "cost": tot_cost,
+        "calls": len(events),
+        "sources": sorted(sources),
+        "by_model": dict(sorted(by_model.items(), key=lambda kv: (kv[1]["cost"], kv[1]["cached"] + kv[1]["uncached"]), reverse=True)),
+    }
+
+
+def fmt_num(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def fmt_short(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def render_bar(ratio: float, width: int = 36, color: str = "cyan") -> Text:
+    width = max(10, width)
+    clamped = max(0.0, min(1.0, ratio))
+    filled = max(1 if clamped > 0 else 0, int(round(clamped * width)))
+    t = Text()
+    t.append("█" * filled, style=color)
+    t.append("░" * max(0, width - filled), style="bright_black")
+    return t
+
+
+def build_aligned_trend(events: list, range_key: str, now: datetime) -> list:
+    """按自然整点/整刻度对齐时间桶，防止已结束历史时段在刷新时来回跳动"""
+    if range_key == "1h":
+        slot_sec = 300
+        num_buckets = 12
+        end_slot = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        start_slot = end_slot - timedelta(minutes=5 * (num_buckets - 1))
+        fmt = "%H:%M"
+    elif range_key == "7d":
+        slot_sec = 43200
+        num_buckets = 14
+        end_slot = now.replace(hour=12 if now.hour >= 12 else 0, minute=0, second=0, microsecond=0)
+        start_slot = end_slot - timedelta(hours=12 * (num_buckets - 1))
+        fmt = "%m/%d %H"
+    else:
+        slot_sec = 3600
+        num_buckets = 24
+        end_slot = now.replace(minute=0, second=0, microsecond=0)
+        start_slot = end_slot - timedelta(hours=num_buckets - 1)
+        fmt = "%H:00"
+
+    buckets = [{"cached": 0, "total": 0, "calls": 0} for _ in range(num_buckets)]
+    start_ts = start_slot.timestamp()
+    for e in events:
+        idx = int((e["ts"].timestamp() - start_ts) // slot_sec)
+        if 0 <= idx < num_buckets:
+            buckets[idx]["cached"] += e["cached"]
+            buckets[idx]["total"] += e["cached"] + e["uncached"] + e["cache_write"]
+            buckets[idx]["calls"] += 1
+
+    trend = []
+    for i, b in enumerate(buckets):
+        t_slot = start_slot + timedelta(seconds=i * slot_sec)
+        lbl = t_slot.strftime(fmt)
+        hr = (b["cached"] / b["total"] * 100.0) if b["total"] > 0 else -1.0
+        trend.append({
+            "label": lbl,
+            "hitRate": round(hr, 1),
+            "hasData": b["total"] > 0,
+            "calls": b["calls"],
+            "tokensShort": fmt_short(b["total"]),
+        })
+    return trend
+
+
+def render_model_sparkline(model_events: list, range_key: str, now: datetime, width: int = 38, height: int = 4, color: str = "cyan") -> Text:
+    """在终端小窗内绘制单一模型的整点平滑 Braille 走势图"""
+    width = max(18, width)
+    height = max(4, height)
+    trend = build_aligned_trend(model_events, range_key, now)
+    n_slots = len(trend)
+    cols = width * 2
+    rows = height * 4
+
+    grid = [[0 for _ in range(width)] for _ in range(height)]
+    bit_map = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
+
+    def plot(px: int, py: int):
+        if 0 <= px < cols and 0 <= py < rows:
+            cx, dx = divmod(px, 2)
+            cy, dy = divmod(py, 4)
+            grid[cy][cx] |= bit_map[dx][dy]
+
+    # 把每个整点桶映射到对应的水平点位，短间隙平滑连线保持视觉清晰
+    prev_px, prev_py, prev_idx = None, None, -99
+    for idx, slot in enumerate(trend):
+        if not slot["hasData"]:
+            continue
+        px = int(round(idx / max(1, n_slots - 1) * (cols - 1)))
+        val = max(0.0, min(1.0, slot["hitRate"] / 100.0))
+        py = int(round((1.0 - val) * (rows - 1)))
+        plot(px, py)
+        if prev_px is not None and (idx - prev_idx) <= 4:
+            steps = max(1, abs(px - prev_px))
+            for s in range(1, steps + 1):
+                ix = prev_px + int(round((px - prev_px) * s / steps))
+                iy = prev_py + int(round((py - prev_py) * s / steps))
+                plot(ix, iy)
+        prev_px, prev_py, prev_idx = px, py, idx
+
+    out = Text()
+    for r in range(height):
+        if r == 0:
+            lbl = "100%"
+        elif r == height // 2:
+            lbl = " 50%"
+        elif r == height - 1:
+            lbl = "  0%"
+        else:
+            lbl = "    "
+        out.append(f"{lbl} │ ", style="bright_black")
+        out.append("".join(chr(0x2800 + cell) for cell in grid[r]) + "\n", style=color)
+
+    out.append("     └" + "─" * width + "\n", style="bright_black")
+    first_lbl = trend[0]["label"] if trend else ""
+    mid_lbl = trend[len(trend) // 2]["label"] if trend else ""
+    last_lbl = trend[-1]["label"] if trend else ""
+    gap = max(1, (width - len(first_lbl) - len(mid_lbl) - len(last_lbl)) // 2)
+    axis_str = f"      {first_lbl}{' ' * gap}{mid_lbl}{' ' * gap}{last_lbl}"
+    out.append(axis_str[: width + 6], style="bright_black")
+    return out
+
+
+def build_layout(events: list, range_key: str, table_mode: bool, term_w: int, term_h: int) -> Layout:
+    range_keys_map = {"1": ("1h", 60, "过去 1 小时"), "2": ("24h", 1440, "过去 24 小时"), "3": ("7d", 10080, "过去 7 天")}
+    r_code, minutes, range_label = range_keys_map[range_key]
+    now = datetime.now().astimezone()
+    agg = aggregate(events)
+
+    panel_w = max(24, (term_w // 2) - 6)
+    sub_chart_w = max(18, (term_w // 2) - 14)
+    sub_chart_h = max(4, min(6, (term_h - 27) // 2))
+
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="top", size=16),
+        Layout(name="bottom", ratio=1),
+        Layout(name="footer", size=1),
+    )
+    layout["top"].split_row(Layout(name="composition", ratio=1), Layout(name="cost", ratio=1))
+
+    hdr = Text()
+    hdr.append(" 󰧑 AI 模型用量与缓存监控 ", style="bold cyan")
+    hdr.append(f" [{range_label}]", style="bright_black")
+    hdr.append(f"   估值总费: ${agg['cost']:.2f}  ·  平均缓存命中: {agg['hit_rate']:.1f}%  ·  调用次数: {len(events)}", style="bold")
+    layout["header"].update(Panel(hdr, box=box.ROUNDED, border_style="bright_black"))
+
+    # 左上: Token 构成分布
+    comp = Text()
+    ratio_per_out = (agg["cached"] / agg["output"]) if agg["output"] > 0 else 0
+    comp.append(f"平均每 1 个生成 Token 对应 {ratio_per_out:.0f} 个缓存读取 Token\n\n", style="bright_black")
+
+    tot = agg["total"] or 1
+    rows = [
+        ("缓存读取输入", agg["cached"], "cyan"),
+        ("常规未缓存输入", agg["uncached"], "blue"),
+        ("生成与思考输出", agg["output"], "magenta"),
+    ]
+    if agg["cache_write"] > 0:
+        rows.insert(2, ("缓存写入输入", agg["cache_write"], "yellow"))
+
+    for label, val, color in rows:
+        pct = val / tot * 100.0
+        comp.append("■ ", style=color)
+        comp.append(f"{label:<14}", style="bold")
+        comp.append(f"{fmt_num(val):>13} ", style="bold")
+        comp.append(f"{pct:5.1f}%\n", style="bright_black")
+        comp.append(render_bar(val / tot, width=panel_w, color=color))
+        comp.append("\n\n")
+
+    if agg["cache_write"] == 0:
+        comp.append("缓存写入: 0 (当前时间段内无缓存写入数据)", style="bright_black")
+
+    layout["composition"].update(
+        Panel(comp, title="[bold]Token 构成分布[/bold]", title_align="left", box=box.ROUNDED, border_style="bright_black")
+    )
+
+    # 右上: 按模型费用与平均缓存 (完整展示前 4 名主力模型)
+    cost_txt = Text()
+    cost_txt.append(f"共 {len(agg['by_model'])} 个活跃模型 (按估值排序 · 前 4 名)\n", style="bright_black")
+    max_cost = max((v["cost"] for v in agg["by_model"].values()), default=1.0) or 1.0
+    model_colors = ["cyan", "green", "yellow", "magenta"]
+
+    top_models = list(agg["by_model"].items())[:4]
+    for idx, (model, data) in enumerate(top_models):
+        m_in = data["cached"] + data["uncached"] + data["cache_write"]
+        m_tot = m_in + data["output"]
+        hr = (data["cached"] / m_in * 100.0) if m_in > 0 else 0.0
+        eff_rate = (data["cost"] / (m_tot / 1_000_000.0)) if m_tot > 0 else 0.0
+        color = model_colors[idx % 4]
+        name_cap = max(12, panel_w - 22)
+        short_model = model[:name_cap]
+        cost_txt.append("■ ", style=color)
+        cost_txt.append(f"{short_model:<{name_cap}}", style="bold")
+        cost_txt.append(f" 缓存 {hr:4.1f}% ", style=color)
+        cost_txt.append(f"${data['cost']:>6.2f}\n", style="bold green")
+        cost_txt.append(render_bar(data["cost"] / max_cost, width=panel_w, color=color))
+        cost_txt.append(f"\n{fmt_short(m_tot)} tokens · {data['calls']}次 · 均价 ${eff_rate:.2f}/M\n", style="bright_black")
+
+    if not agg["by_model"]:
+        cost_txt.append("当前时间段内暂无活跃模型调用记录。\n", style="bright_black")
+
+    layout["cost"].update(
+        Panel(cost_txt, title="[bold]按模型费用与平均缓存[/bold]", title_align="left", box=box.ROUNDED, border_style="bright_black")
+    )
+
+    # 底部: 按模型切分为 4 个独立走势窗口 (2x2 网格) 或全部明细表
+    if table_mode:
+        tbl = Table(box=box.SIMPLE, expand=True, header_style="bold cyan")
+        tbl.add_column("模型名称")
+        tbl.add_column("调用次数", justify="right")
+        tbl.add_column("缓存读取", justify="right")
+        tbl.add_column("常规输入", justify="right")
+        tbl.add_column("生成输出", justify="right")
+        tbl.add_column("平均缓存", justify="right")
+        tbl.add_column("等效估值", justify="right")
+        for model, d in agg["by_model"].items():
+            m_in = d["cached"] + d["uncached"] + d["cache_write"]
+            hr = (d["cached"] / m_in * 100.0) if m_in > 0 else 0.0
+            tbl.add_row(
+                model,
+                str(d["calls"]),
+                fmt_short(d["cached"]),
+                fmt_short(d["uncached"]),
+                fmt_short(d["output"]),
+                f"{hr:.1f}%",
+                f"${d['cost']:.2f}",
+            )
+        layout["bottom"].update(
+            Panel(
+                tbl,
+                title="[bold]全部活跃模型数据明细表[/bold]",
+                title_align="left",
+                box=box.ROUNDED,
+                border_style="bright_black",
+            )
+        )
+    else:
+        events_by_model = defaultdict(list)
+        for e in events:
+            events_by_model[e["model"]].append(e)
+
+        layout["bottom"].split_column(
+            Layout(name="b_row1", ratio=1),
+            Layout(name="b_row2", ratio=1),
+        )
+        layout["bottom"]["b_row1"].split_row(Layout(name="m0", ratio=1), Layout(name="m1", ratio=1))
+        layout["bottom"]["b_row2"].split_row(Layout(name="m2", ratio=1), Layout(name="m3", ratio=1))
+        slot_names = ["m0", "m1", "m2", "m3"]
+
+        for idx in range(4):
+            slot = layout["bottom"]["b_row1" if idx < 2 else "b_row2"][slot_names[idx]]
+            if idx < len(top_models):
+                m_name, m_data = top_models[idx]
+                m_in = m_data["cached"] + m_data["uncached"] + m_data["cache_write"]
+                m_hr = (m_data["cached"] / m_in * 100.0) if m_in > 0 else 0.0
+                color = model_colors[idx % 4]
+                chart_txt = render_model_sparkline(
+                    events_by_model.get(m_name, []),
+                    r_code,
+                    now,
+                    width=sub_chart_w,
+                    height=sub_chart_h,
+                    color=color,
+                )
+                title = f"[bold {color}]#{idx + 1} {m_name}[/bold {color}] [bright_black](缓存均值 {m_hr:.1f}% · ${m_data['cost']:.2f})[/bright_black]"
+                slot.update(Panel(chart_txt, title=title, title_align="left", box=box.ROUNDED, border_style="bright_black"))
+            else:
+                slot.update(Panel(Text("\n暂无更多活跃模型", style="bright_black"), title=f"[bright_black]#{idx + 1} 空闲槽位[/bright_black]", title_align="left", box=box.ROUNDED, border_style="bright_black"))
+
+    layout["footer"].update(Text(" [1] 过去 1 小时  [2] 过去 24 小时  [3] 过去 7 天  ·  [T] 切换 4 分窗走势与全模型表格  ·  [R] 立即刷新  ·  [Q] 退出 ", style="bright_black"))
+    return layout
+
+
+def build_detail_payload(range_key: str = "24h", demo: bool = False) -> dict:
+    """生成供 Omarchy 原生 PopupCard 插件渲染的全中文详细 JSON 数据 (含前 4 模型分立走势)"""
+    range_map = {
+        "1h": (60, "过去 1 小时"),
+        "24h": (1440, "过去 24 小时"),
+        "7d": (10080, "过去 7 天"),
+    }
+    minutes, range_label = range_map.get(range_key, (1440, "过去 24 小时"))
+    now = datetime.now().astimezone()
+    since = now - timedelta(minutes=minutes)
+
+    trend_since = since - timedelta(hours=1) if range_key != "7d" else since - timedelta(hours=12)
+    all_events = load_events(trend_since, demo=demo)
+    events = [e for e in all_events if e["ts"] >= since]
+    agg = aggregate(events)
+
+    if range_key == "24h":
+        agg_24h = agg
+    else:
+        since_24h = now - timedelta(hours=24)
+        events_24h = load_events(since_24h, demo=demo)
+        agg_24h = aggregate(events_24h)
+
+    tot = agg["total"] or 1
+    tot_in = agg["cached"] + agg["uncached"] + agg["cache_write"]
+
+    models_list = []
+    max_cost = max((v["cost"] for v in agg["by_model"].values()), default=0.0)
+    for m_name, d in list(agg["by_model"].items())[:20]:
+        m_in = d["cached"] + d["uncached"] + d["cache_write"]
+        m_tot = m_in + d["output"]
+        hr = (d["cached"] / m_in * 100.0) if m_in > 0 else 0.0
+        eff_rate = (d["cost"] / (m_tot / 1_000_000.0)) if m_tot > 0 else 0.0
+        models_list.append({
+            "name": m_name,
+            "calls": d["calls"],
+            "cached": d["cached"],
+            "cachedShort": fmt_short(d["cached"]),
+            "uncached": d["uncached"],
+            "uncachedShort": fmt_short(d["uncached"]),
+            "cacheWrite": d["cache_write"],
+            "output": d["output"],
+            "outputShort": fmt_short(d["output"]),
+            "total": m_tot,
+            "totalShort": fmt_short(m_tot),
+            "hitRate": round(hr, 1),
+            "cost": round(d["cost"], 2),
+            "costRatio": round((d["cost"] / max_cost) if max_cost > 0 else 0.0, 4),
+            "effectivePer1M": round(eff_rate, 2),
+        })
+
+    # 按模型分类切分前 4 个模型各自的走势
+    events_by_model = defaultdict(list)
+    for e in all_events:
+        events_by_model[e["model"]].append(e)
+
+    palette = ["#00e5ff", "#34d399", "#fbbf24", "#c084fc"]
+    model_trends = []
+    for idx, m_info in enumerate(models_list[:4]):
+        m_name = m_info["name"]
+        model_trends.append({
+            "rank": idx + 1,
+            "name": m_name,
+            "color": palette[idx % 4],
+            "hitRate": m_info["hitRate"],
+            "cost": m_info["cost"],
+            "calls": m_info["calls"],
+            "totalShort": m_info["totalShort"],
+            "buckets": build_aligned_trend(events_by_model.get(m_name, []), range_key, now),
+        })
+
+    tooltip_lines = [
+        f"过去 24 小时模型用量 ({len(agg_24h['by_model'])} 个模型)",
+        "────────────────────────────",
+        f"等效估值: ${agg_24h['cost']:.2f}",
+        f"缓存命中: {agg_24h['hit_rate']:.1f}%",
+        f"调用次数: {agg_24h['calls']} 次",
+        f"Token 总量: {fmt_short(agg_24h['total'])} (输入: {fmt_short(agg_24h['cached'] + agg_24h['uncached'])}, 输出: {fmt_short(agg_24h['output'])})",
+    ]
+    if agg_24h["by_model"]:
+        tooltip_lines.append("")
+        for m, d in list(agg_24h["by_model"].items())[:6]:
+            m_in = d["cached"] + d["uncached"] + d["cache_write"]
+            hr = (d["cached"] / m_in * 100.0) if m_in > 0 else 0.0
+            tooltip_lines.append(f"• {m}: ${d['cost']:.2f} (缓存 {hr:.1f}%)")
+    tooltip_lines.append("\n左键点击展开或收回详情卡片")
+
+    source_names_cn = {
+        "antigravity": "Antigravity",
+        "omp": "OMP",
+        "devin-cli": "Devin CLI",
+        "claude-code": "Claude Code",
+        "codex": "Codex CLI",
+        "opencode": "OpenCode",
+        "pi": "Pi",
+        "custom": "自定义日志",
+        "demo": "模拟演示数据",
+    }
+    sources_cn = [source_names_cn.get(s, s) for s in agg["sources"]]
+
+    return {
+        "barText": f"󰧑 ${agg_24h['cost']:.2f} · {agg_24h['hit_rate']:.1f}%",
+        "tooltip": "\n".join(tooltip_lines),
+        "rangeKey": range_key,
+        "rangeLabel": range_label,
+        "updatedAt": now.strftime("%H:%M:%S"),
+        "cost": round(agg["cost"], 2),
+        "hitRate": round(agg["hit_rate"], 1),
+        "calls": agg["calls"],
+        "totalTokens": agg["total"],
+        "totalTokensShort": fmt_short(agg["total"]),
+        "cached": agg["cached"],
+        "cachedShort": fmt_num(agg["cached"]),
+        "cachedPct": round(agg["cached"] / tot * 100.0, 1) if agg["total"] > 0 else 0.0,
+        "uncached": agg["uncached"],
+        "uncachedShort": fmt_num(agg["uncached"]),
+        "uncachedPct": round(agg["uncached"] / tot * 100.0, 1) if agg["total"] > 0 else 0.0,
+        "cacheWrite": agg["cache_write"],
+        "cacheWriteShort": fmt_num(agg["cache_write"]),
+        "cacheWritePct": round(agg["cache_write"] / tot * 100.0, 1) if agg["total"] > 0 else 0.0,
+        "output": agg["output"],
+        "outputShort": fmt_num(agg["output"]),
+        "outputPct": round(agg["output"] / tot * 100.0, 1) if agg["total"] > 0 else 0.0,
+        "cacheMultiplier": round((agg["cached"] / agg["output"]) if agg["output"] > 0 else 0.0, 1),
+        "inputTotalShort": fmt_short(tot_in),
+        "models": models_list,
+        "modelTrends": model_trends,
+        "sources": sources_cn,
+    }
+
+
+def run_waybar(demo: bool = False):
+    since = datetime.now().astimezone() - timedelta(hours=24)
+    events = load_events(since, demo=demo)
+    agg = aggregate(events)
+
+    lines = [
+        f"过去 24 小时模型用量 ({len(agg['by_model'])} 个模型)",
+        "────────────────────────────",
+        f"等效估值: ${agg['cost']:.2f}",
+        f"缓存命中: {agg['hit_rate']:.1f}%",
+        f"Token 量: {fmt_short(agg['total'])} (输入: {fmt_short(agg['cached'] + agg['uncached'])}, 输出: {fmt_short(agg['output'])})",
+    ]
+    if agg["by_model"]:
+        lines.append("")
+        for m, d in list(agg["by_model"].items())[:6]:
+            m_in = d["cached"] + d["uncached"] + d["cache_write"]
+            hr = (d["cached"] / m_in * 100.0) if m_in > 0 else 0.0
+            lines.append(f"• {m}: ${d['cost']:.2f} (缓存 {hr:.1f}%)")
+    lines.append("\n点击查看详情")
+
+    css_class = "high-cache" if agg["hit_rate"] >= 70 else ("low-cache" if agg["total"] > 0 else "idle")
+    print(json.dumps({
+        "text": f"󰧑 ${agg['cost']:.2f} · {agg['hit_rate']:.1f}%",
+        "tooltip": "\n".join(lines),
+        "class": css_class,
+    }, ensure_ascii=False))
+
+
+def run_check():
+    since = datetime.now().astimezone() - timedelta(hours=24)
+    sources = {
+        "antigravity": len(load_antigravity_events(since)),
+        "omp": len(load_omp_events(since)),
+        "devin-cli": len(load_devin_events(since)),
+        "claude-code": len(load_claude_events(since)),
+        "codex": len(load_codex_events(since)),
+        "opencode": len(load_opencode_events(since)),
+        "pi": len(load_pi_events(since)),
+        "custom-jsonl": len(load_custom_events(since)),
+    }
+    print("omarchy-ai-stats 诊断自检 (过去 24 小时):")
+    for name, count in sources.items():
+        print(f"  - {name:<14}: {count} 条调用记录")
+    print(f"自定义日志路径: {CUSTOM_LOG}")
+    print(f"模型价格配置  : {PRICING_FILE} ({'已加载' if PRICING_FILE.exists() else '使用默认单价'})")
+    print("\n过去 24 小时详细 JSON 摘要:")
+    payload = build_detail_payload("24h", demo=False)
+    print(f"  顶栏文本: {payload['barText']}")
+    print(f"  调用次数: {payload['calls']}  等效估值: ${payload['cost']:.2f}  平均缓存命中: {payload['hitRate']:.1f}%")
+    print(f"  活跃模型数: {len(payload['models'])} 个 (前 4 名已切分独立走势窗口)")
+    for m in payload["models"][:8]:
+        print(f"    • {m['name']:<32} 调用 {m['calls']:>4} 次 | 平均缓存 {m['hitRate']:>5.1f}% | 估值 ${m['cost']:.2f}")
+
+
+def run_tui(demo: bool = False):
+    if not HAS_RICH:
+        sys.stderr.write("错误: 需要 python-rich 依赖。请运行: sudo pacman -S python-rich\n")
+        sys.exit(1)
+    console = Console()
+    range_key = "2"
+    table_mode = False
+    ranges = {"1": 60, "2": 1440, "3": 10080}
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        with Live(console=console, screen=True, refresh_per_second=4) as live:
+            last_fetch = 0.0
+            events = []
+            while True:
+                now_ts = time.time()
+                if now_ts - last_fetch >= 5.0:
+                    since = datetime.now().astimezone() - timedelta(minutes=ranges[range_key])
+                    events = load_events(since, demo=demo)
+                    last_fetch = now_ts
+                    sz = shutil.get_terminal_size((120, 38))
+                    live.update(build_layout(events, range_key, table_mode, sz.columns, sz.lines))
+
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch in ("q", "Q", "\x1b"):
+                        break
+                    elif ch in ("1", "2", "3"):
+                        range_key = ch
+                        last_fetch = 0.0
+                    elif ch in ("t", "T"):
+                        table_mode = not table_mode
+                        sz = shutil.get_terminal_size((120, 38))
+                        live.update(build_layout(events, range_key, table_mode, sz.columns, sz.lines))
+                    elif ch in ("r", "R"):
+                        last_fetch = 0.0
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Omarchy AI 模型用量与 Prompt Caching 监控工具")
+    parser.add_argument("--waybar", action="store_true", help="输出 Waybar JSON 状态")
+    parser.add_argument("--json-detail", action="store_true", help="输出供原生插件卡片使用的详细 JSON")
+    parser.add_argument("--range", choices=["1h", "24h", "7d"], default="24h", help="统计时间范围 (默认 24h)")
+    parser.add_argument("--check", action="store_true", help="运行本机日志源与配置自检")
+    parser.add_argument("--demo", action="store_true", help="使用模拟数据进行预览")
+    args = parser.parse_args()
+
+    if args.waybar:
+        run_waybar(demo=args.demo)
+    elif args.json_detail:
+        print(json.dumps(build_detail_payload(range_key=args.range, demo=args.demo), ensure_ascii=False))
+    elif args.check:
+        run_check()
+    else:
+        run_tui(demo=args.demo)
+
+
+if __name__ == "__main__":
+    main()

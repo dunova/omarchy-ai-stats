@@ -1,0 +1,9 @@
+#custom-ai-usage {
+  padding: 0 10px;
+  margin: 0 4px;
+  color: inherit;
+}
+
+#custom-ai-usage.idle {
+  opacity: 0.55;
+}
