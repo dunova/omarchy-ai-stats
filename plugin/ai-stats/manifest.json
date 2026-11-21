@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "dunova.ai-stats",
   "name": "AI 模型用量与缓存",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "dunova",
   "description": "Live AI model token cost and Prompt Caching hit rate monitor",
   "kinds": ["bar-widget"],

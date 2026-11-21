@@ -71,6 +71,7 @@ FALLBACK_PRICE = [1.00, 0.10, 0.00, 5.00]
 
 CONFIG_DIR = Path.home() / ".config/omarchy-ai-stats"
 PRICING_FILE = CONFIG_DIR / "pricing.json"
+STATE_FILE = CONFIG_DIR / "state.json"
 CACHE_DIR = Path.home() / ".cache/omarchy-ai-stats"
 CUSTOM_LOG = Path.home() / ".local/share/ai-usage/events.jsonl"
 CLAUDE_GLOB = str(Path.home() / ".claude/projects/**/*.jsonl")
@@ -103,6 +104,51 @@ def load_pricing() -> dict:
 
 
 MODEL_PRICING = load_pricing()
+
+
+def load_state() -> dict:
+    state = {"reset_ts": 0.0, "theme": "dark"}
+    if STATE_FILE.exists():
+        try:
+            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                if isinstance(raw.get("reset_ts"), (int, float)):
+                    state["reset_ts"] = float(raw["reset_ts"])
+                if raw.get("theme") in ("dark", "light"):
+                    state["theme"] = raw["theme"]
+        except Exception:
+            pass
+    return state
+
+
+def save_state(state: dict):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+        clear_detail_cache()
+    except Exception:
+        pass
+
+
+def clear_detail_cache():
+    try:
+        if CACHE_DIR.exists():
+            for p in CACHE_DIR.glob("detail-*.json*"):
+                p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def effective_since(since: datetime) -> datetime:
+    state = load_state()
+    reset_ts = state.get("reset_ts", 0.0) or 0.0
+    if reset_ts > 0:
+        reset_dt = datetime.fromtimestamp(reset_ts, tz=timezone.utc).astimezone()
+        if reset_dt > since:
+            return reset_dt
+    return since
 
 
 def get_pricing(model: str):
@@ -606,9 +652,11 @@ def load_custom_events(since: datetime) -> list:
     return events
 
 
-def load_events(since: datetime, demo: bool = False) -> list:
+def load_events(since: datetime, demo: bool = False, apply_reset: bool = True) -> list:
     if demo:
         return generate_demo_events()
+    if apply_reset:
+        since = effective_since(since)
     events = []
     events.extend(load_antigravity_events(since))
     events.extend(load_omp_events(since))
@@ -798,6 +846,11 @@ def build_layout(events: list, range_key: str, table_mode: bool, term_w: int, te
     range_keys_map = {"1": ("1h", 60, "过去 1 小时"), "2": ("24h", 1440, "过去 24 小时"), "3": ("7d", 10080, "过去 7 天")}
     r_code, minutes, range_label = range_keys_map[range_key]
     now = datetime.now().astimezone()
+    state = load_state()
+    reset_ts = state.get("reset_ts", 0.0) or 0.0
+    if reset_ts > 0:
+        reset_str = datetime.fromtimestamp(reset_ts, tz=timezone.utc).astimezone().strftime("%H:%M:%S")
+        range_label = f"{range_label} · 自 {reset_str} 起"
     agg = aggregate(events)
 
     panel_w = max(24, (term_w // 2) - 6)
@@ -942,7 +995,7 @@ def build_layout(events: list, range_key: str, table_mode: bool, term_w: int, te
             else:
                 slot.update(Panel(Text("\n暂无更多活跃模型", style="bright_black"), title=f"[bright_black]#{idx + 1} 空闲槽位[/bright_black]", title_align="left", box=box.ROUNDED, border_style="bright_black"))
 
-    layout["footer"].update(Text(" [1] 过去 1 小时  [2] 过去 24 小时  [3] 过去 7 天  ·  [T] 切换 4 分窗走势与全模型表格  ·  [R] 立即刷新  ·  [Q] 退出 ", style="bright_black"))
+    layout["footer"].update(Text(" [1] 1小时 [2] 24小时 [3] 7天 · [T] 切换视图 · [C] 清零从0算 [X] 恢复历史 · [R] 刷新 · [Q] 退出 ", style="bright_black"))
     return layout
 
 
@@ -955,11 +1008,18 @@ def build_detail_payload(range_key: str = "24h", demo: bool = False) -> dict:
     }
     minutes, range_label = range_map.get(range_key, (1440, "过去 24 小时"))
     now = datetime.now().astimezone()
-    since = now - timedelta(minutes=minutes)
+    state = load_state()
+    reset_ts = state.get("reset_ts", 0.0) or 0.0
+    reset_label = ""
+    if reset_ts > 0:
+        reset_dt = datetime.fromtimestamp(reset_ts, tz=timezone.utc).astimezone()
+        reset_label = f"自 {reset_dt.strftime('%H:%M:%S')} 起"
 
+    since = now - timedelta(minutes=minutes)
     trend_since = since - timedelta(hours=1) if range_key != "7d" else since - timedelta(hours=12)
     all_events = load_events(trend_since, demo=demo)
-    events = [e for e in all_events if e["ts"] >= since]
+    eff_since = since if demo else effective_since(since)
+    events = [e for e in all_events if e["ts"] >= eff_since]
     agg = aggregate(events)
 
     if range_key == "24h":
@@ -1040,6 +1100,9 @@ def build_detail_payload(range_key: str = "24h", demo: bool = False) -> dict:
         "tooltip": "\n".join(tooltip_lines),
         "rangeKey": range_key,
         "rangeLabel": range_label,
+        "resetTs": reset_ts,
+        "resetLabel": reset_label,
+        "theme": state.get("theme", "dark"),
         "updatedAt": now.strftime("%H:%M:%S"),
         "cost": round(agg["cost"], 2),
         "hitRate": round(agg["hit_rate"], 1),
@@ -1158,6 +1221,16 @@ def run_tui(demo: bool = False):
                         live.update(build_layout(events, range_key, table_mode, sz.columns, sz.lines))
                     elif ch in ("r", "R"):
                         last_fetch = 0.0
+                    elif ch in ("c", "C"):
+                        st = load_state()
+                        st["reset_ts"] = time.time()
+                        save_state(st)
+                        last_fetch = 0.0
+                    elif ch in ("x", "X"):
+                        st = load_state()
+                        st["reset_ts"] = 0.0
+                        save_state(st)
+                        last_fetch = 0.0
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -1167,16 +1240,38 @@ def main():
     parser.add_argument("--waybar", action="store_true", help="输出 Waybar JSON 状态")
     parser.add_argument("--json-detail", action="store_true", help="输出供原生插件卡片使用的详细 JSON")
     parser.add_argument("--no-cache", action="store_true", help="跳过短期缓存强制重新扫描数据库")
+    parser.add_argument("--reset", action="store_true", help="设置清空基线时间戳，从当前时刻起从零计算")
+    parser.add_argument("--restore", action="store_true", help="清除清空基线，恢复完整历史统计")
+    parser.add_argument("--set-theme", choices=["dark", "light"], help="设置弹窗主题 (dark 黑夜 / light 白天)")
     parser.add_argument("--range", choices=["1h", "24h", "7d"], default="24h", help="统计时间范围 (默认 24h)")
     parser.add_argument("--check", action="store_true", help="运行本机日志源与配置自检")
     parser.add_argument("--demo", action="store_true", help="使用模拟数据进行预览")
     args = parser.parse_args()
 
+    if args.reset:
+        st = load_state()
+        st["reset_ts"] = time.time()
+        save_state(st)
+        if not args.json_detail:
+            print("已设置从当前时刻重新统计。")
+    if args.restore:
+        st = load_state()
+        st["reset_ts"] = 0.0
+        save_state(st)
+        if not args.json_detail:
+            print("已恢复完整历史统计。")
+    if args.set_theme:
+        st = load_state()
+        st["theme"] = args.set_theme
+        save_state(st)
+        if not args.json_detail:
+            print(f"已切换主题为: {args.set_theme}")
+
     if args.waybar:
         run_waybar(demo=args.demo)
     elif args.json_detail:
         cache_file = CACHE_DIR / f"detail-{args.range}.json"
-        if not args.demo and not args.no_cache and cache_file.exists():
+        if not args.demo and not args.no_cache and not args.reset and not args.restore and not args.set_theme and cache_file.exists():
             try:
                 if time.time() - cache_file.stat().st_mtime < 8.0:
                     print(cache_file.read_text(encoding="utf-8"))
@@ -1196,7 +1291,7 @@ def main():
         print(out_str)
     elif args.check:
         run_check()
-    else:
+    elif not (args.reset or args.restore or args.set_theme):
         run_tui(demo=args.demo)
 
 

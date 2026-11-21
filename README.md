@@ -1,23 +1,24 @@
 # omarchy-ai-stats
 
-[![Version](https://img.shields.io/badge/version-v0.1.1-00e5ff.svg)](VERSION)
+[![Version](https://img.shields.io/badge/version-v0.1.2-00e5ff.svg)](VERSION)
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Omarchy%20%7C%20Hyprland-60a5fa.svg)](#)
 
-专为 **Omarchy（Quickshell + Hyprland）** 与 Waybar 打造的本地 AI 模型用量、费用估值与 Prompt Caching 缓存命中率实时监控插件。默认全中文界面，聚焦**过去 24 小时**真实消耗与各主力模型分窗缓存走势。
+专为 **Omarchy（Quickshell + Hyprland）** 与 Waybar 打造的本地 AI 模型用量、费用估值与 Prompt Caching 缓存命中率实时监控插件。默认全中文界面，聚焦**过去 24 小时**真实消耗与各主力模型分窗缓存走势，支持**白天 / 黑夜双主题即时切换**以及**非破坏性清空基线从零观测**。
 
 ---
 
 ## 📸 UI 预览
 
-### 1. Omarchy 顶栏状态与点击弹出卡片（PopupCard）
+### 1. Omarchy 顶栏状态与点击弹出卡片（白天 / 黑夜双主题）
 
-左键点击顶栏图标平滑弹出详情卡片，再次点击（或点击桌面其他区域）自动平滑收回；右键点击立即刷新数据。
+左键点击顶栏图标平滑弹出详情卡片，再次点击（或点击桌面其他区域）自动平滑收回；右上角支持一键切换 **白天 / 黑夜** 主题并持久化记忆，右下角支持 **清空（从零重算）** 与 **恢复历史**。
 
 ![Omarchy 顶栏小组件](./assets/bar-widget.png)
 
 <p align="center">
-  <img src="./assets/popup-card.png" alt="Omarchy PopupCard 弹出卡片" width="500" />
+  <img src="./assets/popup-card.png" alt="Omarchy PopupCard 黑夜主题" width="440" />
+  <img src="./assets/popup-card-light.png" alt="Omarchy PopupCard 白天主题" width="440" />
 </p>
 
 ### 2. 全中文交互式终端看板（TUI Dashboard）
@@ -30,7 +31,8 @@
 
 ## ✨ 核心特性
 
-- **点击即弹、再点收回的原生桌面体验**：基于 Omarchy Shell 原生 `PopupCard` 构建，自动跟随当前 Omarchy 主题色、圆角与磨砂玻璃特效，告别独立弹窗遮挡。
+- **点击即弹、再点收回与白天/黑夜双主题**：基于 Omarchy Shell 原生 `PopupCard` 构建，卡片右上角支持 **☀ 白天 / 🌙 黑夜** 两套高对比色板一键切换并自动保存偏好。
+- **非破坏性清空与从零观测**：点击底部 **清空** 按钮（或终端按 `c` 键）可设置统计基线时间戳，不删除任何原始会话文件，立即从零重新累计新请求的模型用量、平均缓存命中率与独立走势；随时可点击 **恢复历史**（或终端按 `x` 键）一键还原全部历史数据。
 - **过去 24 小时默认聚合 + 多时间段切换**：顶栏、弹出卡片及终端看板默认统计过去 24 小时，支持一键切换 `1 小时`、`24 小时`、`7 天`。
 - **前 4 模型分窗独立走势**：不再把不同模型混在一条曲线里导致波动失真；主界面将前 4 名主力模型切割为 4 个独立小窗，按自然整点 / 整刻度时间桶固定对齐，历史时段数值静态锁定不跳动。
 - **全本地多 Agent 日志直采**：零额外代理侵入，直接读取本地 SQLite / JSONL 日志：
@@ -81,6 +83,7 @@ cd omarchy-ai-stats
   - `omarchy-ai-stats --check`：诊断本机各数据源检测到的调用数量与状态
   - `1` / `2` / `3`：切换 `过去 1 小时` / `过去 24 小时` / `过去 7 天`
   - `t`：在 `4 分窗走势图` 与 `全模型数据明细表` 之间切换
+  - `c` / `x`：清零统计基线（从零重算） / 恢复完整历史统计
   - `r`：立即刷新数据
   - `q` / `Esc`：退出终端看板
 
@@ -122,4 +125,4 @@ cd omarchy-ai-stats
 
 ## 📄 开源协议
 
-本项目基于 [MIT License](./LICENSE) 开源发布，当前版本 `v0.1.1`。
+本项目基于 [MIT License](./LICENSE) 开源发布，当前版本 `v0.1.2`。
